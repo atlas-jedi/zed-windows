@@ -920,7 +920,22 @@ impl Pane {
         cx: &AppContext,
     ) -> Option<Box<dyn ItemHandle>> {
         self.items.iter().find_map(|item| {
-            if item.is_singleton(cx) && item.project_entry_ids(cx).as_slice() == [entry_id] {
+            if item.is_singleton(cx) && (item.project_entry_ids(cx).as_slice() == [entry_id]) {
+                Some(item.boxed_clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn item_for_path(
+        &self,
+        project_path: ProjectPath,
+        cx: &AppContext,
+    ) -> Option<Box<dyn ItemHandle>> {
+        self.items.iter().find_map(move |item| {
+            if item.is_singleton(cx) && (item.project_path(cx).as_slice() == [project_path.clone()])
+            {
                 Some(item.boxed_clone())
             } else {
                 None
@@ -1485,8 +1500,13 @@ impl Pane {
                         })?;
                         match answer {
                             Ok(0) => {}
-                            Ok(1) => return Ok(true), // Don't save this file
-                            _ => return Ok(false),    // Cancel
+                            Ok(1) => {
+                                // Don't save this file
+                                pane.update(cx, |_, cx| item.discarded(project, cx))
+                                    .log_err();
+                                return Ok(true);
+                            }
+                            _ => return Ok(false), // Cancel
                         }
                     } else {
                         return Ok(false);
@@ -1632,7 +1652,7 @@ impl Pane {
             .and_then(|entry| entry.project_path(cx))
             .map(|p| p.path.to_string_lossy().to_string())
         {
-            cx.write_to_clipboard(ClipboardItem::new(clipboard_text));
+            cx.write_to_clipboard(ClipboardItem::new_string(clipboard_text));
         }
     }
 
@@ -1842,7 +1862,7 @@ impl Pane {
                                     "Copy Path",
                                     Some(Box::new(CopyPath)),
                                     cx.handler_for(&pane, move |_, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new(
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
                                             abs_path.to_string_lossy().to_string(),
                                         ));
                                     }),
