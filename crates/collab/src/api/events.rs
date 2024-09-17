@@ -1,5 +1,6 @@
 use super::ips_file::IpsFile;
 use crate::api::CloudflareIpCountryHeader;
+use crate::clickhouse::write_to_table;
 use crate::{api::slack, AppState, Error, Result};
 use anyhow::{anyhow, Context};
 use aws_sdk_s3::primitives::ByteStream;
@@ -396,7 +397,7 @@ pub async fn post_events(
         match &wrapper.event {
             Event::Editor(event) => to_upload.editor_events.push(EditorEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 country_code.clone(),
@@ -409,7 +410,7 @@ pub async fn post_events(
                     .inline_completion_events
                     .push(InlineCompletionEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         first_event_at,
                         country_code.clone(),
@@ -418,7 +419,7 @@ pub async fn post_events(
             }
             Event::Call(event) => to_upload.call_events.push(CallEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -428,7 +429,7 @@ pub async fn post_events(
                     .assistant_events
                     .push(AssistantEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         first_event_at,
                         checksum_matched,
@@ -436,42 +437,42 @@ pub async fn post_events(
             }
             Event::Cpu(event) => to_upload.cpu_events.push(CpuEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Memory(event) => to_upload.memory_events.push(MemoryEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::App(event) => to_upload.app_events.push(AppEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Setting(event) => to_upload.setting_events.push(SettingEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Edit(event) => to_upload.edit_events.push(EditEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Action(event) => to_upload.action_events.push(ActionEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -485,7 +486,7 @@ pub async fn post_events(
                     .extension_events
                     .push(ExtensionEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         metadata,
                         first_event_at,
@@ -494,7 +495,7 @@ pub async fn post_events(
             }
             Event::Repl(event) => to_upload.repl_events.push(ReplEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -529,12 +530,12 @@ struct ToUpload {
 impl ToUpload {
     pub async fn upload(&self, clickhouse_client: &clickhouse::Client) -> anyhow::Result<()> {
         const EDITOR_EVENTS_TABLE: &str = "editor_events";
-        Self::upload_to_table(EDITOR_EVENTS_TABLE, &self.editor_events, clickhouse_client)
+        write_to_table(EDITOR_EVENTS_TABLE, &self.editor_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{EDITOR_EVENTS_TABLE}'"))?;
 
         const INLINE_COMPLETION_EVENTS_TABLE: &str = "inline_completion_events";
-        Self::upload_to_table(
+        write_to_table(
             INLINE_COMPLETION_EVENTS_TABLE,
             &self.inline_completion_events,
             clickhouse_client,
@@ -543,7 +544,7 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{INLINE_COMPLETION_EVENTS_TABLE}'"))?;
 
         const ASSISTANT_EVENTS_TABLE: &str = "assistant_events";
-        Self::upload_to_table(
+        write_to_table(
             ASSISTANT_EVENTS_TABLE,
             &self.assistant_events,
             clickhouse_client,
@@ -552,27 +553,27 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{ASSISTANT_EVENTS_TABLE}'"))?;
 
         const CALL_EVENTS_TABLE: &str = "call_events";
-        Self::upload_to_table(CALL_EVENTS_TABLE, &self.call_events, clickhouse_client)
+        write_to_table(CALL_EVENTS_TABLE, &self.call_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{CALL_EVENTS_TABLE}'"))?;
 
         const CPU_EVENTS_TABLE: &str = "cpu_events";
-        Self::upload_to_table(CPU_EVENTS_TABLE, &self.cpu_events, clickhouse_client)
+        write_to_table(CPU_EVENTS_TABLE, &self.cpu_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{CPU_EVENTS_TABLE}'"))?;
 
         const MEMORY_EVENTS_TABLE: &str = "memory_events";
-        Self::upload_to_table(MEMORY_EVENTS_TABLE, &self.memory_events, clickhouse_client)
+        write_to_table(MEMORY_EVENTS_TABLE, &self.memory_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{MEMORY_EVENTS_TABLE}'"))?;
 
         const APP_EVENTS_TABLE: &str = "app_events";
-        Self::upload_to_table(APP_EVENTS_TABLE, &self.app_events, clickhouse_client)
+        write_to_table(APP_EVENTS_TABLE, &self.app_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{APP_EVENTS_TABLE}'"))?;
 
         const SETTING_EVENTS_TABLE: &str = "setting_events";
-        Self::upload_to_table(
+        write_to_table(
             SETTING_EVENTS_TABLE,
             &self.setting_events,
             clickhouse_client,
@@ -581,7 +582,7 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{SETTING_EVENTS_TABLE}'"))?;
 
         const EXTENSION_EVENTS_TABLE: &str = "extension_events";
-        Self::upload_to_table(
+        write_to_table(
             EXTENSION_EVENTS_TABLE,
             &self.extension_events,
             clickhouse_client,
@@ -590,45 +591,19 @@ impl ToUpload {
         .with_context(|| format!("failed to upload to table '{EXTENSION_EVENTS_TABLE}'"))?;
 
         const EDIT_EVENTS_TABLE: &str = "edit_events";
-        Self::upload_to_table(EDIT_EVENTS_TABLE, &self.edit_events, clickhouse_client)
+        write_to_table(EDIT_EVENTS_TABLE, &self.edit_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{EDIT_EVENTS_TABLE}'"))?;
 
         const ACTION_EVENTS_TABLE: &str = "action_events";
-        Self::upload_to_table(ACTION_EVENTS_TABLE, &self.action_events, clickhouse_client)
+        write_to_table(ACTION_EVENTS_TABLE, &self.action_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{ACTION_EVENTS_TABLE}'"))?;
 
         const REPL_EVENTS_TABLE: &str = "repl_events";
-        Self::upload_to_table(REPL_EVENTS_TABLE, &self.repl_events, clickhouse_client)
+        write_to_table(REPL_EVENTS_TABLE, &self.repl_events, clickhouse_client)
             .await
             .with_context(|| format!("failed to upload to table '{REPL_EVENTS_TABLE}'"))?;
-
-        Ok(())
-    }
-
-    async fn upload_to_table<T: clickhouse::Row + Serialize + std::fmt::Debug>(
-        table: &str,
-        rows: &[T],
-        clickhouse_client: &clickhouse::Client,
-    ) -> anyhow::Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut insert = clickhouse_client.insert(table)?;
-
-        for event in rows {
-            insert.write(event).await?;
-        }
-
-        insert.end().await?;
-
-        let event_count = rows.len();
-        log::info!(
-            "wrote {event_count} {event_specifier} to '{table}'",
-            event_specifier = if event_count == 1 { "event" } else { "events" }
-        );
 
         Ok(())
     }
@@ -1351,13 +1326,11 @@ impl ActionEventRow {
 }
 
 pub fn calculate_json_checksum(app: Arc<AppState>, json: &impl AsRef<[u8]>) -> Option<Vec<u8>> {
-    let Some(checksum_seed) = app.config.zed_client_checksum_seed.as_ref() else {
-        return None;
-    };
+    let checksum_seed = app.config.zed_client_checksum_seed.as_ref()?;
 
     let mut summer = Sha256::new();
     summer.update(checksum_seed);
-    summer.update(&json);
+    summer.update(json);
     summer.update(checksum_seed);
     Some(summer.finalize().into_iter().collect())
 }

@@ -10,7 +10,10 @@ use html_to_markdown::{
     convert_html_to_markdown, HandleTag, HandlerOutcome, HtmlElement, MarkdownWriter,
     StartTagOutcome, TagHandler,
 };
-use zed_extension_api::{self as zed, HttpMethod, HttpRequest, KeyValueStore, Result};
+use zed_extension_api::{
+    http_client::{HttpMethod, HttpRequest, RedirectPolicy},
+    KeyValueStore, Result,
+};
 
 pub fn index(package: String, database: &KeyValueStore) -> Result<()> {
     let headers = vec![(
@@ -18,12 +21,13 @@ pub fn index(package: String, database: &KeyValueStore) -> Result<()> {
         "Zed (Gleam Extension)".to_string(),
     )];
 
-    let response = zed::fetch(&HttpRequest {
-        method: HttpMethod::Get,
-        url: format!("https://hexdocs.pm/{package}"),
-        headers: headers.clone(),
-        body: None,
-    })?;
+    let response = HttpRequest::builder()
+        .method(HttpMethod::Get)
+        .url(format!("https://hexdocs.pm/{package}"))
+        .headers(headers.clone())
+        .redirect_policy(RedirectPolicy::FollowAll)
+        .build()?
+        .fetch()?;
 
     let (package_root_markdown, modules) =
         convert_hexdocs_to_markdown(&mut io::Cursor::new(&response.body))?;
@@ -31,12 +35,13 @@ pub fn index(package: String, database: &KeyValueStore) -> Result<()> {
     database.insert(&package, &package_root_markdown)?;
 
     for module in modules {
-        let response = zed::fetch(&HttpRequest {
-            method: HttpMethod::Get,
-            url: format!("https://hexdocs.pm/{package}/{module}.html"),
-            headers: headers.clone(),
-            body: None,
-        })?;
+        let response = HttpRequest::builder()
+            .method(HttpMethod::Get)
+            .url(format!("https://hexdocs.pm/{package}/{module}.html"))
+            .headers(headers.clone())
+            .redirect_policy(RedirectPolicy::FollowAll)
+            .build()?
+            .fetch()?;
 
         let (markdown, _modules) =
             convert_hexdocs_to_markdown(&mut io::Cursor::new(&response.body))?;
@@ -125,10 +130,10 @@ pub struct GleamChromeRemover;
 
 impl HandleTag for GleamChromeRemover {
     fn should_handle(&self, tag: &str) -> bool {
-        match tag {
-            "head" | "script" | "style" | "svg" | "header" | "footer" | "a" => true,
-            _ => false,
-        }
+        matches!(
+            tag,
+            "head" | "script" | "style" | "svg" | "header" | "footer" | "a"
+        )
     }
 
     fn handle_tag_start(
@@ -183,10 +188,7 @@ impl GleamModuleCollector {
 
 impl HandleTag for GleamModuleCollector {
     fn should_handle(&self, tag: &str) -> bool {
-        match tag {
-            "h2" | "a" => true,
-            _ => false,
-        }
+        matches!(tag, "h2" | "a")
     }
 
     fn handle_tag_start(
@@ -194,15 +196,10 @@ impl HandleTag for GleamModuleCollector {
         tag: &HtmlElement,
         writer: &mut MarkdownWriter,
     ) -> StartTagOutcome {
-        match tag.tag() {
-            "a" => {
-                if self.has_seen_modules_header && writer.is_inside("li") {
-                    if let Some(module_name) = Self::parse_module(tag) {
-                        self.modules.insert(module_name);
-                    }
-                }
+        if tag.tag() == "a" && self.has_seen_modules_header && writer.is_inside("li") {
+            if let Some(module_name) = Self::parse_module(tag) {
+                self.modules.insert(module_name);
             }
-            _ => {}
         }
 
         StartTagOutcome::Continue

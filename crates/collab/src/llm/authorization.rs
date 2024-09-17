@@ -7,16 +7,17 @@ use crate::{Config, Error, Result};
 pub fn authorize_access_to_language_model(
     config: &Config,
     claims: &LlmTokenClaims,
-    country_code: Option<String>,
+    country_code: Option<&str>,
     provider: LanguageModelProvider,
     model: &str,
 ) -> Result<()> {
     authorize_access_for_country(config, country_code, provider)?;
-    authorize_access_to_model(claims, provider, model)?;
+    authorize_access_to_model(config, claims, provider, model)?;
     Ok(())
 }
 
 fn authorize_access_to_model(
+    config: &Config,
     claims: &LlmTokenClaims,
     provider: LanguageModelProvider,
     model: &str,
@@ -25,20 +26,27 @@ fn authorize_access_to_model(
         return Ok(());
     }
 
-    match (provider, model) {
-        (LanguageModelProvider::Anthropic, model) if model.starts_with("claude-3.5-sonnet") => {
-            Ok(())
+    if provider == LanguageModelProvider::Anthropic {
+        if model == "claude-3-5-sonnet" {
+            return Ok(());
         }
-        _ => Err(Error::http(
-            StatusCode::FORBIDDEN,
-            format!("access to model {model:?} is not included in your plan"),
-        ))?,
+
+        if claims.has_llm_closed_beta_feature_flag
+            && Some(model) == config.llm_closed_beta_model_name.as_deref()
+        {
+            return Ok(());
+        }
     }
+
+    Err(Error::http(
+        StatusCode::FORBIDDEN,
+        format!("access to model {model:?} is not included in your plan"),
+    ))
 }
 
 fn authorize_access_for_country(
     config: &Config,
-    country_code: Option<String>,
+    country_code: Option<&str>,
     provider: LanguageModelProvider,
 ) -> Result<()> {
     // In development we won't have the `CF-IPCountry` header, so we can't check
@@ -51,7 +59,7 @@ fn authorize_access_for_country(
     }
 
     // https://developers.cloudflare.com/fundamentals/reference/http-request-headers/#cf-ipcountry
-    let country_code = match country_code.as_deref() {
+    let country_code = match country_code {
         // `XX` - Used for clients without country code data.
         None | Some("XX") => Err(Error::http(
             StatusCode::BAD_REQUEST,
@@ -74,7 +82,9 @@ fn authorize_access_for_country(
     if !is_country_supported_by_provider {
         Err(Error::http(
             StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-            format!("access to {provider:?} models is not available in your region"),
+            format!(
+                "access to {provider:?} models is not available in your region ({country_code})"
+            ),
         ))?
     }
 
@@ -115,7 +125,7 @@ mod tests {
             authorize_access_to_language_model(
                 &config,
                 &claims,
-                Some(country_code.into()),
+                Some(country_code),
                 provider,
                 "the-model",
             )
@@ -165,7 +175,7 @@ mod tests {
             let error_response = authorize_access_to_language_model(
                 &config,
                 &claims,
-                Some(country_code.into()),
+                Some(country_code),
                 provider,
                 "the-model",
             )
@@ -184,7 +194,7 @@ mod tests {
                 .to_vec();
             assert_eq!(
                 String::from_utf8(response_body).unwrap(),
-                format!("access to {provider:?} models is not available in your region")
+                format!("access to {provider:?} models is not available in your region ({country_code})")
             );
         }
     }
@@ -210,7 +220,7 @@ mod tests {
             let error_response = authorize_access_to_language_model(
                 &config,
                 &claims,
-                Some(country_code.into()),
+                Some(country_code),
                 provider,
                 "the-model",
             )
@@ -240,14 +250,14 @@ mod tests {
             (
                 Plan::ZedPro,
                 LanguageModelProvider::Anthropic,
-                "claude-3.5-sonnet",
+                "claude-3-5-sonnet",
                 true,
             ),
             // Free plan should have access to claude-3.5-sonnet
             (
                 Plan::Free,
                 LanguageModelProvider::Anthropic,
-                "claude-3.5-sonnet",
+                "claude-3-5-sonnet",
                 true,
             ),
             // Pro plan should NOT have access to other Anthropic models
@@ -265,13 +275,8 @@ mod tests {
                 ..Default::default()
             };
 
-            let result = authorize_access_to_language_model(
-                &config,
-                &claims,
-                Some("US".into()),
-                provider,
-                model,
-            );
+            let result =
+                authorize_access_to_language_model(&config, &claims, Some("US"), provider, model);
 
             if expected_access {
                 assert!(
@@ -303,7 +308,7 @@ mod tests {
 
         // Staff should have access to all models
         let test_cases = vec![
-            (LanguageModelProvider::Anthropic, "claude-3.5-sonnet"),
+            (LanguageModelProvider::Anthropic, "claude-3-5-sonnet"),
             (LanguageModelProvider::Anthropic, "claude-2"),
             (LanguageModelProvider::Anthropic, "claude-123-agi"),
             (LanguageModelProvider::OpenAi, "gpt-4"),
@@ -311,13 +316,8 @@ mod tests {
         ];
 
         for (provider, model) in test_cases {
-            let result = authorize_access_to_language_model(
-                &config,
-                &claims,
-                Some("US".into()),
-                provider,
-                model,
-            );
+            let result =
+                authorize_access_to_language_model(&config, &claims, Some("US"), provider, model);
 
             assert!(
                 result.is_ok(),
