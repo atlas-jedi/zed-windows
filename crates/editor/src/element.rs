@@ -64,7 +64,7 @@ use std::{
     sync::Arc,
 };
 use sum_tree::Bias;
-use theme::{ActiveTheme, PlayerColor};
+use theme::{ActiveTheme, Appearance, PlayerColor};
 use ui::prelude::*;
 use ui::{h_flex, ButtonLike, ButtonStyle, ContextMenu, Tooltip};
 use util::RangeExt;
@@ -376,6 +376,13 @@ impl EditorElement {
                 cx.propagate();
             }
         });
+        register_action(view, cx, |editor, action, cx| {
+            if let Some(task) = editor.format_selections(action, cx) {
+                task.detach_and_log_err(cx);
+            } else {
+                cx.propagate();
+            }
+        });
         register_action(view, cx, Editor::restart_language_server);
         register_action(view, cx, Editor::cancel_language_server_work);
         register_action(view, cx, Editor::show_character_palette);
@@ -436,7 +443,9 @@ impl EditorElement {
         register_action(view, cx, Editor::accept_inline_completion);
         register_action(view, cx, Editor::revert_file);
         register_action(view, cx, Editor::revert_selected_hunks);
-        register_action(view, cx, Editor::open_active_item_in_terminal)
+        register_action(view, cx, Editor::apply_selected_diff_hunks);
+        register_action(view, cx, Editor::open_active_item_in_terminal);
+        register_action(view, cx, Editor::reload_file)
     }
 
     fn register_key_listeners(&self, cx: &mut WindowContext, layout: &EditorLayout) {
@@ -636,11 +645,30 @@ impl EditorElement {
             cx.stop_propagation();
         } else if end_selection && pending_nonempty_selections {
             cx.stop_propagation();
-        } else if cfg!(target_os = "linux")
-            && event.button == MouseButton::Middle
-            && (!text_hitbox.is_hovered(cx) || editor.read_only(cx))
-        {
-            return;
+        } else if cfg!(target_os = "linux") && event.button == MouseButton::Middle {
+            if !text_hitbox.is_hovered(cx) || editor.read_only(cx) {
+                return;
+            }
+
+            #[cfg(target_os = "linux")]
+            if EditorSettings::get_global(cx).middle_click_paste {
+                if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+                    let point_for_position =
+                        position_map.point_for_position(text_hitbox.bounds, event.position);
+                    let position = point_for_position.previous_valid;
+
+                    editor.select(
+                        SelectPhase::Begin {
+                            position,
+                            add: false,
+                            click_count: 1,
+                        },
+                        cx,
+                    );
+                    editor.insert(&text, cx);
+                }
+                cx.stop_propagation()
+            }
         }
     }
 
@@ -995,8 +1023,20 @@ impl EditorElement {
                         block_width = em_width;
                     }
                     let block_text = if let CursorShape::Block = selection.cursor_shape {
-                        snapshot.display_chars_at(cursor_position).next().and_then(
-                            |(character, _)| {
+                        snapshot
+                            .display_chars_at(cursor_position)
+                            .next()
+                            .or_else(|| {
+                                if cursor_column == 0 {
+                                    snapshot
+                                        .placeholder_text()
+                                        .and_then(|s| s.chars().next())
+                                        .map(|c| (c, cursor_position))
+                                } else {
+                                    None
+                                }
+                            })
+                            .and_then(|(character, _)| {
                                 let text = if character == '\n' {
                                     SharedString::from(" ")
                                 } else {
@@ -1011,6 +1051,22 @@ impl EditorElement {
                                     })
                                     .unwrap_or(self.style.text.font());
 
+                                // Invert the text color for the block cursor. Ensure that the text
+                                // color is opaque enough to be visible against the background color.
+                                //
+                                // 0.75 is an arbitrary threshold to determine if the background color is
+                                // opaque enough to use as a text color.
+                                //
+                                // TODO: In the future we should ensure themes have a `text_inverse` color.
+                                let color = if cx.theme().colors().editor_background.a < 0.75 {
+                                    match cx.theme().appearance {
+                                        Appearance::Dark => Hsla::black(),
+                                        Appearance::Light => Hsla::white(),
+                                    }
+                                } else {
+                                    cx.theme().colors().editor_background
+                                };
+
                                 cx.text_system()
                                     .shape_line(
                                         text,
@@ -1018,15 +1074,14 @@ impl EditorElement {
                                         &[TextRun {
                                             len,
                                             font,
-                                            color: self.style.background,
+                                            color,
                                             background_color: None,
                                             strikethrough: None,
                                             underline: None,
                                         }],
                                     )
                                     .log_err()
-                            },
-                        )
+                            })
                     } else {
                         None
                     };
@@ -1646,7 +1701,16 @@ impl EditorElement {
                         return None;
                     }
                     if snapshot.is_line_folded(multibuffer_row) {
-                        return None;
+                        // Skip folded indicators, unless it's the starting line of a fold.
+                        if multibuffer_row
+                            .0
+                            .checked_sub(1)
+                            .map_or(false, |previous_row| {
+                                snapshot.is_line_folded(MultiBufferRow(previous_row))
+                            })
+                        {
+                            return None;
+                        }
                     }
                     let button = editor.render_run_indicator(
                         &self.style,
@@ -6031,7 +6095,7 @@ impl CursorLayout {
                 origin: self.origin + origin,
                 size: size(self.block_width, self.line_height),
             },
-            CursorShape::Underscore => Bounds {
+            CursorShape::Underline => Bounds {
                 origin: self.origin
                     + origin
                     + gpui::Point::new(Pixels::ZERO, self.line_height - px(2.0)),

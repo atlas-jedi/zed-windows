@@ -18,14 +18,14 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, View, ViewContext, VisualContext, WeakView,
 };
 use project::{Project, RepositoryEntry};
-use recent_projects::RecentProjects;
+use recent_projects::{OpenRemote, RecentProjects};
 use rpc::proto::{self, DevServerStatus};
 use smallvec::SmallVec;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
-    h_flex, prelude::*, Avatar, Button, ButtonLike, ButtonStyle, ContextMenu, Icon, IconName,
-    Indicator, PopoverMenu, Tooltip,
+    h_flex, prelude::*, Avatar, Button, ButtonLike, ButtonStyle, ContextMenu, Icon,
+    IconButtonShape, IconName, IconSize, Indicator, PopoverMenu, Tooltip,
 };
 use util::ResultExt;
 use vcs_menu::{BranchList, OpenRecent as ToggleVcsMenu};
@@ -76,7 +76,7 @@ impl Render for TitleBar {
         let supported_controls = cx.window_controls();
         let decorations = cx.window_decorations();
         let titlebar_color = if cfg!(target_os = "linux") {
-            if cx.is_window_active() {
+            if cx.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background
             } else {
                 cx.theme().colors().title_bar_inactive_background
@@ -262,6 +262,77 @@ impl TitleBar {
         self
     }
 
+    fn render_ssh_project_host(&self, cx: &mut ViewContext<Self>) -> Option<AnyElement> {
+        let host = self.project.read(cx).ssh_connection_string(cx)?;
+
+        let (indicator_color, meta) = match self.project.read(cx).ssh_connection_state(cx)? {
+            remote::ConnectionState::Connecting => (Color::Info, format!("Connecting to: {host}")),
+            remote::ConnectionState::Connected => (Color::Success, format!("Connected to: {host}")),
+            remote::ConnectionState::HeartbeatMissed => (
+                Color::Warning,
+                format!("Connection attempt to {host} missed. Retrying..."),
+            ),
+            remote::ConnectionState::Reconnecting => (
+                Color::Warning,
+                format!("Lost connection to {host}. Reconnecting..."),
+            ),
+            remote::ConnectionState::Disconnected => {
+                (Color::Error, format!("Disconnected from {host}"))
+            }
+        };
+
+        let indicator_border_color = cx.theme().colors().title_bar_background;
+
+        let icon_color = match self.project.read(cx).ssh_connection_state(cx)? {
+            remote::ConnectionState::Connecting => Color::Info,
+            remote::ConnectionState::Connected => Color::Default,
+            remote::ConnectionState::HeartbeatMissed => Color::Warning,
+            remote::ConnectionState::Reconnecting => Color::Warning,
+            remote::ConnectionState::Disconnected => Color::Error,
+        };
+
+        let meta = SharedString::from(meta);
+
+        let indicator = h_flex()
+            // We're using the circle inside a circle approach because, otherwise, by using borders
+            // we'd get a very thin, leaking indicator color, which is not what we want.
+            .absolute()
+            .size_2p5()
+            .right_0()
+            .bottom_0()
+            .bg(indicator_border_color)
+            .size_2p5()
+            .rounded_full()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .child(Indicator::dot().color(indicator_color));
+
+        Some(
+            div()
+                .relative()
+                .child(
+                    IconButton::new("ssh-server-icon", IconName::Server)
+                        .icon_size(IconSize::Small)
+                        .shape(IconButtonShape::Square)
+                        .icon_color(icon_color)
+                        .tooltip(move |cx| {
+                            Tooltip::with_meta(
+                                "Remote Project",
+                                Some(&OpenRemote),
+                                meta.clone(),
+                                cx,
+                            )
+                        })
+                        .on_click(|_, cx| {
+                            cx.dispatch_action(OpenRemote.boxed_clone());
+                        }),
+                )
+                .child(indicator)
+                .into_any_element(),
+        )
+    }
+
     pub fn render_project_host(&self, cx: &mut ViewContext<Self>) -> Option<AnyElement> {
         if let Some(dev_server) =
             self.project
@@ -296,8 +367,11 @@ impl TitleBar {
                     .into_any_element(),
             );
         }
+        if self.project.read(cx).is_via_ssh() {
+            return self.render_ssh_project_host(cx);
+        }
 
-        if self.project.read(cx).is_disconnected() {
+        if self.project.read(cx).is_disconnected(cx) {
             return Some(
                 Button::new("disconnected", "Disconnected")
                     .disabled(true)

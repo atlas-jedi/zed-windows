@@ -61,7 +61,7 @@ use debounced_delay::DebouncedDelay;
 use display_map::*;
 pub use display_map::{DisplayPoint, FoldPlaceholder};
 pub use editor_settings::{
-    CurrentLineHighlight, EditorSettings, ScrollBeyondLastLine, SearchSettings,
+    CurrentLineHighlight, EditorSettings, ScrollBeyondLastLine, SearchSettings, ShowScrollbar,
 };
 pub use editor_settings_controls::*;
 use element::LineWithInvisibles;
@@ -96,7 +96,9 @@ use language::{
     CursorShape, Diagnostic, Documentation, IndentKind, IndentSize, Language, OffsetRangeExt,
     Point, Selection, SelectionGoal, TransactionId,
 };
-use language::{point_to_lsp, BufferRow, CharClassifier, Runnable, RunnableRange};
+use language::{
+    point_to_lsp, BufferRow, CharClassifier, LanguageServerName, Runnable, RunnableRange,
+};
 use linked_editing_ranges::refresh_linked_ranges;
 pub use proposed_changes_editor::{
     ProposedChangesBuffer, ProposedChangesEditor, ProposedChangesEditorToolbar,
@@ -121,10 +123,11 @@ use multi_buffer::{
 };
 use ordered_float::OrderedFloat;
 use parking_lot::{Mutex, RwLock};
-use project::project_settings::{GitGutterSetting, ProjectSettings};
 use project::{
-    lsp_store::FormatTrigger, CodeAction, Completion, CompletionIntent, Item, Location, Project,
-    ProjectPath, ProjectTransaction, TaskSourceKind,
+    lsp_store::{FormatTarget, FormatTrigger},
+    project_settings::{GitGutterSetting, ProjectSettings},
+    CodeAction, Completion, CompletionIntent, DocumentHighlight, InlayHint, Item, Location,
+    LocationLink, Project, ProjectPath, ProjectTransaction, TaskSourceKind,
 };
 use rand::prelude::*;
 use rpc::{proto::*, ErrorExt};
@@ -160,11 +163,11 @@ use ui::{
 };
 use util::{defer, maybe, post_inc, RangeExt, ResultExt, TryFutureExt};
 use workspace::item::{ItemHandle, PreviewTabsSettings};
-use workspace::notifications::{DetachAndPromptErr, NotificationId};
+use workspace::notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt};
 use workspace::{
     searchable::SearchEvent, ItemNavHistory, SplitDirection, ViewId, Workspace, WorkspaceId,
 };
-use workspace::{OpenInTerminal, OpenTerminal, TabBarSettings, Toast};
+use workspace::{Item as WorkspaceItem, OpenInTerminal, OpenTerminal, TabBarSettings, Toast};
 
 use crate::hover_links::find_url;
 use crate::signature_help::{SignatureHelpHiddenBy, SignatureHelpState};
@@ -546,6 +549,7 @@ pub struct Editor {
     active_diagnostics: Option<ActiveDiagnosticGroup>,
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
     project: Option<Model<Project>>,
+    semantics_provider: Option<Rc<dyn SemanticsProvider>>,
     completion_provider: Option<Box<dyn CompletionProvider>>,
     collaboration_hub: Option<Box<dyn CollaborationHub>>,
     blink_manager: Model<BlinkManager>,
@@ -884,12 +888,12 @@ enum ContextMenu {
 impl ContextMenu {
     fn select_first(
         &mut self,
-        project: Option<&Model<Project>>,
+        provider: Option<&dyn CompletionProvider>,
         cx: &mut ViewContext<Editor>,
     ) -> bool {
         if self.visible() {
             match self {
-                ContextMenu::Completions(menu) => menu.select_first(project, cx),
+                ContextMenu::Completions(menu) => menu.select_first(provider, cx),
                 ContextMenu::CodeActions(menu) => menu.select_first(cx),
             }
             true
@@ -900,12 +904,12 @@ impl ContextMenu {
 
     fn select_prev(
         &mut self,
-        project: Option<&Model<Project>>,
+        provider: Option<&dyn CompletionProvider>,
         cx: &mut ViewContext<Editor>,
     ) -> bool {
         if self.visible() {
             match self {
-                ContextMenu::Completions(menu) => menu.select_prev(project, cx),
+                ContextMenu::Completions(menu) => menu.select_prev(provider, cx),
                 ContextMenu::CodeActions(menu) => menu.select_prev(cx),
             }
             true
@@ -916,12 +920,12 @@ impl ContextMenu {
 
     fn select_next(
         &mut self,
-        project: Option<&Model<Project>>,
+        provider: Option<&dyn CompletionProvider>,
         cx: &mut ViewContext<Editor>,
     ) -> bool {
         if self.visible() {
             match self {
-                ContextMenu::Completions(menu) => menu.select_next(project, cx),
+                ContextMenu::Completions(menu) => menu.select_next(provider, cx),
                 ContextMenu::CodeActions(menu) => menu.select_next(cx),
             }
             true
@@ -932,12 +936,12 @@ impl ContextMenu {
 
     fn select_last(
         &mut self,
-        project: Option<&Model<Project>>,
+        provider: Option<&dyn CompletionProvider>,
         cx: &mut ViewContext<Editor>,
     ) -> bool {
         if self.visible() {
             match self {
-                ContextMenu::Completions(menu) => menu.select_last(project, cx),
+                ContextMenu::Completions(menu) => menu.select_last(provider, cx),
                 ContextMenu::CodeActions(menu) => menu.select_last(cx),
             }
             true
@@ -991,39 +995,55 @@ struct CompletionsMenu {
 }
 
 impl CompletionsMenu {
-    fn select_first(&mut self, project: Option<&Model<Project>>, cx: &mut ViewContext<Editor>) {
+    fn select_first(
+        &mut self,
+        provider: Option<&dyn CompletionProvider>,
+        cx: &mut ViewContext<Editor>,
+    ) {
         self.selected_item = 0;
         self.scroll_handle.scroll_to_item(self.selected_item);
-        self.attempt_resolve_selected_completion_documentation(project, cx);
+        self.attempt_resolve_selected_completion_documentation(provider, cx);
         cx.notify();
     }
 
-    fn select_prev(&mut self, project: Option<&Model<Project>>, cx: &mut ViewContext<Editor>) {
+    fn select_prev(
+        &mut self,
+        provider: Option<&dyn CompletionProvider>,
+        cx: &mut ViewContext<Editor>,
+    ) {
         if self.selected_item > 0 {
             self.selected_item -= 1;
         } else {
             self.selected_item = self.matches.len() - 1;
         }
         self.scroll_handle.scroll_to_item(self.selected_item);
-        self.attempt_resolve_selected_completion_documentation(project, cx);
+        self.attempt_resolve_selected_completion_documentation(provider, cx);
         cx.notify();
     }
 
-    fn select_next(&mut self, project: Option<&Model<Project>>, cx: &mut ViewContext<Editor>) {
+    fn select_next(
+        &mut self,
+        provider: Option<&dyn CompletionProvider>,
+        cx: &mut ViewContext<Editor>,
+    ) {
         if self.selected_item + 1 < self.matches.len() {
             self.selected_item += 1;
         } else {
             self.selected_item = 0;
         }
         self.scroll_handle.scroll_to_item(self.selected_item);
-        self.attempt_resolve_selected_completion_documentation(project, cx);
+        self.attempt_resolve_selected_completion_documentation(provider, cx);
         cx.notify();
     }
 
-    fn select_last(&mut self, project: Option<&Model<Project>>, cx: &mut ViewContext<Editor>) {
+    fn select_last(
+        &mut self,
+        provider: Option<&dyn CompletionProvider>,
+        cx: &mut ViewContext<Editor>,
+    ) {
         self.selected_item = self.matches.len() - 1;
         self.scroll_handle.scroll_to_item(self.selected_item);
-        self.attempt_resolve_selected_completion_documentation(project, cx);
+        self.attempt_resolve_selected_completion_documentation(provider, cx);
         cx.notify();
     }
 
@@ -1059,7 +1079,7 @@ impl CompletionsMenu {
 
     fn attempt_resolve_selected_completion_documentation(
         &mut self,
-        project: Option<&Model<Project>>,
+        provider: Option<&dyn CompletionProvider>,
         cx: &mut ViewContext<Editor>,
     ) {
         let settings = EditorSettings::get_global(cx);
@@ -1068,18 +1088,16 @@ impl CompletionsMenu {
         }
 
         let completion_index = self.matches[self.selected_item].candidate_id;
-        let Some(project) = project else {
+        let Some(provider) = provider else {
             return;
         };
 
-        let resolve_task = project.update(cx, |project, cx| {
-            project.resolve_completions(
-                self.buffer.clone(),
-                vec![completion_index],
-                self.completions.clone(),
-                cx,
-            )
-        });
+        let resolve_task = provider.resolve_completions(
+            self.buffer.clone(),
+            vec![completion_index],
+            self.completions.clone(),
+            cx,
+        );
 
         let delay_ms =
             EditorSettings::get_global(cx).completion_documentation_secondary_query_debounce;
@@ -1228,6 +1246,10 @@ impl CompletionsMenu {
                                 None
                             };
 
+                        let color_swatch = completion
+                            .color()
+                            .map(|color| div().size_4().bg(color).rounded_sm());
+
                         div().min_w(px(220.)).max_w(px(540.)).child(
                             ListItem::new(mat.candidate_id)
                                 .inset(true)
@@ -1243,6 +1265,7 @@ impl CompletionsMenu {
                                         task.detach_and_log_err(cx)
                                     }
                                 }))
+                                .start_slot::<Div>(color_swatch)
                                 .child(h_flex().overflow_hidden().child(completion_label))
                                 .end_slot::<Label>(documentation_label),
                         )
@@ -1666,7 +1689,7 @@ pub(crate) struct NavigationData {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GotoDefinitionKind {
+pub enum GotoDefinitionKind {
     Symbol,
     Declaration,
     Type,
@@ -1874,10 +1897,17 @@ impl Editor {
                         }
                     }
                 }));
-                let task_inventory = project.read(cx).task_inventory().clone();
-                project_subscriptions.push(cx.observe(&task_inventory, |editor, _, cx| {
-                    editor.tasks_update_task = Some(editor.refresh_runnables(cx));
-                }));
+                if let Some(task_inventory) = project
+                    .read(cx)
+                    .task_store()
+                    .read(cx)
+                    .task_inventory()
+                    .cloned()
+                {
+                    project_subscriptions.push(cx.observe(&task_inventory, |editor, _, cx| {
+                        editor.tasks_update_task = Some(editor.refresh_runnables(cx));
+                    }));
+                }
             }
         }
 
@@ -1925,6 +1955,7 @@ impl Editor {
             active_diagnostics: None,
             soft_wrap_mode_override,
             completion_provider: project.clone().map(|project| Box::new(project) as _),
+            semantics_provider: project.clone().map(|project| Rc::new(project) as _),
             collaboration_hub: project.clone().map(|project| Box::new(project) as _),
             project,
             blink_manager: blink_manager.clone(),
@@ -2293,8 +2324,16 @@ impl Editor {
         self.custom_context_menu = Some(Box::new(f))
     }
 
-    pub fn set_completion_provider(&mut self, provider: Box<dyn CompletionProvider>) {
-        self.completion_provider = Some(provider);
+    pub fn set_completion_provider(&mut self, provider: Option<Box<dyn CompletionProvider>>) {
+        self.completion_provider = provider;
+    }
+
+    pub fn semantics_provider(&self) -> Option<Rc<dyn SemanticsProvider>> {
+        self.semantics_provider.clone()
+    }
+
+    pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {
+        self.semantics_provider = provider;
     }
 
     pub fn set_inline_completion_provider<T>(
@@ -3059,7 +3098,7 @@ impl Editor {
     }
 
     pub fn cancel(&mut self, _: &Cancel, cx: &mut ViewContext<Self>) {
-        if self.clear_clicked_diff_hunks(cx) {
+        if self.clear_expanded_diff_hunks(cx) {
             cx.notify();
             return;
         }
@@ -4029,7 +4068,7 @@ impl Editor {
     }
 
     fn refresh_inlay_hints(&mut self, reason: InlayHintRefreshReason, cx: &mut ViewContext<Self>) {
-        if self.project.is_none() || self.mode != EditorMode::Full {
+        if self.semantics_provider.is_none() || self.mode != EditorMode::Full {
             return;
         }
 
@@ -4683,11 +4722,13 @@ impl Editor {
                                     );
                                 }
                                 project.update(cx, |project, cx| {
-                                    project.task_context_for_location(
-                                        captured_task_variables,
-                                        location,
-                                        cx,
-                                    )
+                                    project.task_store().update(cx, |task_store, cx| {
+                                        task_store.task_context_for_location(
+                                            captured_task_variables,
+                                            location,
+                                            cx,
+                                        )
+                                    })
                                 })
                             });
 
@@ -4899,6 +4940,11 @@ impl Editor {
         Ok(())
     }
 
+    pub fn clear_code_action_providers(&mut self) {
+        self.code_action_providers.clear();
+        self.available_code_actions.take();
+    }
+
     pub fn push_code_action_provider(
         &mut self,
         provider: Arc<dyn CodeActionProvider>,
@@ -4986,7 +5032,7 @@ impl Editor {
             return None;
         }
 
-        let project = self.project.clone()?;
+        let provider = self.semantics_provider.clone()?;
         let buffer = self.buffer.read(cx);
         let newest_selection = self.selections.newest_anchor().clone();
         let cursor_position = newest_selection.head();
@@ -5002,11 +5048,12 @@ impl Editor {
                 .timer(DOCUMENT_HIGHLIGHTS_DEBOUNCE_TIMEOUT)
                 .await;
 
-            let highlights = if let Some(highlights) = project
-                .update(&mut cx, |project, cx| {
-                    project.document_highlights(&cursor_buffer, cursor_buffer_position, cx)
+            let highlights = if let Some(highlights) = cx
+                .update(|cx| {
+                    provider.document_highlights(&cursor_buffer, cursor_buffer_position, cx)
                 })
-                .log_err()
+                .ok()
+                .flatten()
             {
                 highlights.await.log_err()
             } else {
@@ -6196,6 +6243,13 @@ impl Editor {
         }
     }
 
+    pub fn reload_file(&mut self, _: &ReloadFile, cx: &mut ViewContext<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        self.reload(project, cx).detach_and_notify_err(cx);
+    }
+
     pub fn revert_selected_hunks(&mut self, _: &RevertSelectedHunks, cx: &mut ViewContext<Self>) {
         let revert_changes = self.gather_revert_changes(&self.selections.disjoint_anchors(), cx);
         if !revert_changes.is_empty() {
@@ -6203,6 +6257,28 @@ impl Editor {
                 editor.revert(revert_changes, cx);
             });
         }
+    }
+
+    fn apply_selected_diff_hunks(&mut self, _: &ApplyDiffHunk, cx: &mut ViewContext<Self>) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let hunks = hunks_for_selections(&snapshot, &self.selections.disjoint_anchors());
+        let mut ranges_by_buffer = HashMap::default();
+        self.transact(cx, |editor, cx| {
+            for hunk in hunks {
+                if let Some(buffer) = editor.buffer.read(cx).buffer(hunk.buffer_id) {
+                    ranges_by_buffer
+                        .entry(buffer.clone())
+                        .or_insert_with(Vec::new)
+                        .push(hunk.buffer_range.to_offset(buffer.read(cx)));
+                }
+            }
+
+            for (buffer, ranges) in ranges_by_buffer {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.merge_into_base(ranges, cx);
+                });
+            }
+        });
     }
 
     pub fn open_active_item_in_terminal(&mut self, _: &OpenInTerminal, cx: &mut ViewContext<Self>) {
@@ -7406,7 +7482,7 @@ impl Editor {
             .context_menu
             .write()
             .as_mut()
-            .map(|menu| menu.select_first(self.project.as_ref(), cx))
+            .map(|menu| menu.select_first(self.completion_provider.as_deref(), cx))
             .unwrap_or(false)
         {
             return;
@@ -7515,7 +7591,7 @@ impl Editor {
             .context_menu
             .write()
             .as_mut()
-            .map(|menu| menu.select_last(self.project.as_ref(), cx))
+            .map(|menu| menu.select_last(self.completion_provider.as_deref(), cx))
             .unwrap_or(false)
         {
             return;
@@ -7567,25 +7643,25 @@ impl Editor {
 
     pub fn context_menu_first(&mut self, _: &ContextMenuFirst, cx: &mut ViewContext<Self>) {
         if let Some(context_menu) = self.context_menu.write().as_mut() {
-            context_menu.select_first(self.project.as_ref(), cx);
+            context_menu.select_first(self.completion_provider.as_deref(), cx);
         }
     }
 
     pub fn context_menu_prev(&mut self, _: &ContextMenuPrev, cx: &mut ViewContext<Self>) {
         if let Some(context_menu) = self.context_menu.write().as_mut() {
-            context_menu.select_prev(self.project.as_ref(), cx);
+            context_menu.select_prev(self.completion_provider.as_deref(), cx);
         }
     }
 
     pub fn context_menu_next(&mut self, _: &ContextMenuNext, cx: &mut ViewContext<Self>) {
         if let Some(context_menu) = self.context_menu.write().as_mut() {
-            context_menu.select_next(self.project.as_ref(), cx);
+            context_menu.select_next(self.completion_provider.as_deref(), cx);
         }
     }
 
     pub fn context_menu_last(&mut self, _: &ContextMenuLast, cx: &mut ViewContext<Self>) {
         if let Some(context_menu) = self.context_menu.write().as_mut() {
-            context_menu.select_last(self.project.as_ref(), cx);
+            context_menu.select_last(self.completion_provider.as_deref(), cx);
         }
     }
 
@@ -9078,23 +9154,29 @@ impl Editor {
                 .map(|file| (file.worktree_id(cx), file.clone()))
                 .unzip();
 
-            (project.task_inventory().clone(), worktree_id, file)
+            (
+                project.task_store().read(cx).task_inventory().cloned(),
+                worktree_id,
+                file,
+            )
         });
 
-        let inventory = inventory.read(cx);
         let tags = mem::take(&mut runnable.tags);
         let mut tags: Vec<_> = tags
             .into_iter()
             .flat_map(|tag| {
                 let tag = tag.0.clone();
                 inventory
-                    .list_tasks(
-                        file.clone(),
-                        Some(runnable.language.clone()),
-                        worktree_id,
-                        cx,
-                    )
+                    .as_ref()
                     .into_iter()
+                    .flat_map(|inventory| {
+                        inventory.read(cx).list_tasks(
+                            file.clone(),
+                            Some(runnable.language.clone()),
+                            worktree_id,
+                            cx,
+                        )
+                    })
                     .filter(move |(_, template)| {
                         template.tags.iter().any(|source_tag| source_tag == &tag)
                     })
@@ -9552,7 +9634,7 @@ impl Editor {
         split: bool,
         cx: &mut ViewContext<Self>,
     ) -> Task<Result<Navigated>> {
-        let Some(workspace) = self.workspace() else {
+        let Some(provider) = self.semantics_provider.clone() else {
             return Task::ready(Ok(Navigated::No));
         };
         let buffer = self.buffer.read(cx);
@@ -9563,13 +9645,9 @@ impl Editor {
             return Task::ready(Ok(Navigated::No));
         };
 
-        let project = workspace.read(cx).project().clone();
-        let definitions = project.update(cx, |project, cx| match kind {
-            GotoDefinitionKind::Symbol => project.definition(&buffer, head, cx),
-            GotoDefinitionKind::Declaration => project.declaration(&buffer, head, cx),
-            GotoDefinitionKind::Type => project.type_definition(&buffer, head, cx),
-            GotoDefinitionKind::Implementation => project.implementation(&buffer, head, cx),
-        });
+        let Some(definitions) = provider.definitions(&buffer, head, kind, cx) else {
+            return Task::ready(Ok(Navigated::No));
+        };
 
         cx.spawn(|editor, mut cx| async move {
             let definitions = definitions.await?;
@@ -9626,9 +9704,7 @@ impl Editor {
             return;
         };
 
-        let Some(project) = self.project.clone() else {
-            return;
-        };
+        let project = self.project.clone();
 
         cx.spawn(|_, mut cx| async move {
             let result = find_file(&buffer, project, buffer_position, &mut cx).await;
@@ -9819,21 +9895,19 @@ impl Editor {
         &self,
         lsp_location: lsp::Location,
         server_id: LanguageServerId,
-        cx: &mut ViewContext<Editor>,
+        cx: &mut ViewContext<Self>,
     ) -> Task<anyhow::Result<Option<Location>>> {
         let Some(project) = self.project.clone() else {
             return Task::Ready(Some(Ok(None)));
         };
 
         cx.spawn(move |editor, mut cx| async move {
-            let location_task = editor.update(&mut cx, |editor, cx| {
+            let location_task = editor.update(&mut cx, |_, cx| {
                 project.update(cx, |project, cx| {
-                    let language_server_name =
-                        editor.buffer.read(cx).as_singleton().and_then(|buffer| {
-                            project
-                                .language_server_for_buffer(buffer.read(cx), server_id, cx)
-                                .map(|(lsp_adapter, _)| lsp_adapter.name.clone())
-                        });
+                    let language_server_name = project
+                        .language_server_statuses(cx)
+                        .find(|(id, _)| server_id == *id)
+                        .map(|(_, status)| LanguageServerName::from(status.name.as_str()));
                     language_server_name.map(|language_server_name| {
                         project.open_local_buffer_via_lsp(
                             lsp_location.uri.clone(),
@@ -10030,7 +10104,7 @@ impl Editor {
     pub fn rename(&mut self, _: &Rename, cx: &mut ViewContext<Self>) -> Option<Task<Result<()>>> {
         use language::ToOffset as _;
 
-        let project = self.project.clone()?;
+        let provider = self.semantics_provider.clone()?;
         let selection = self.selections.newest_anchor().clone();
         let (cursor_buffer, cursor_buffer_position) = self
             .buffer
@@ -10047,9 +10121,9 @@ impl Editor {
         let snapshot = cursor_buffer.read(cx).snapshot();
         let cursor_buffer_offset = cursor_buffer_position.to_offset(&snapshot);
         let cursor_buffer_offset_end = cursor_buffer_position_end.to_offset(&snapshot);
-        let prepare_rename = project.update(cx, |project, cx| {
-            project.prepare_rename(cursor_buffer.clone(), cursor_buffer_offset, cx)
-        });
+        let prepare_rename = provider
+            .range_for_rename(&cursor_buffer, cursor_buffer_position, cx)
+            .unwrap_or_else(|| Task::ready(Ok(None)));
         drop(snapshot);
 
         Some(cx.spawn(|this, mut cx| async move {
@@ -10220,32 +10294,28 @@ impl Editor {
         cx: &mut ViewContext<Self>,
     ) -> Option<Task<Result<()>>> {
         let rename = self.take_rename(false, cx)?;
-        let workspace = self.workspace()?;
-        let (start_buffer, start) = self
+        let workspace = self.workspace()?.downgrade();
+        let (buffer, start) = self
             .buffer
             .read(cx)
             .text_anchor_for_position(rename.range.start, cx)?;
-        let (end_buffer, end) = self
+        let (end_buffer, _) = self
             .buffer
             .read(cx)
             .text_anchor_for_position(rename.range.end, cx)?;
-        if start_buffer != end_buffer {
+        if buffer != end_buffer {
             return None;
         }
 
-        let buffer = start_buffer;
-        let range = start..end;
         let old_name = rename.old_name;
         let new_name = rename.editor.read(cx).text(cx);
 
-        let rename = workspace
-            .read(cx)
-            .project()
-            .clone()
-            .update(cx, |project, cx| {
-                project.perform_rename(buffer.clone(), range.start, new_name.clone(), true, cx)
-            });
-        let workspace = workspace.downgrade();
+        let rename = self.semantics_provider.as_ref()?.perform_rename(
+            &buffer,
+            start,
+            new_name.clone(),
+            cx,
+        )?;
 
         Some(cx.spawn(|editor, mut cx| async move {
             let project_transaction = rename.await?;
@@ -10316,13 +10386,39 @@ impl Editor {
             None => return None,
         };
 
-        Some(self.perform_format(project, FormatTrigger::Manual, cx))
+        Some(self.perform_format(project, FormatTrigger::Manual, FormatTarget::Buffer, cx))
+    }
+
+    fn format_selections(
+        &mut self,
+        _: &FormatSelections,
+        cx: &mut ViewContext<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let project = match &self.project {
+            Some(project) => project.clone(),
+            None => return None,
+        };
+
+        let selections = self
+            .selections
+            .all_adjusted(cx)
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect_vec();
+
+        Some(self.perform_format(
+            project,
+            FormatTrigger::Manual,
+            FormatTarget::Ranges(selections),
+            cx,
+        ))
     }
 
     fn perform_format(
         &mut self,
         project: Model<Project>,
         trigger: FormatTrigger,
+        target: FormatTarget,
         cx: &mut ViewContext<Self>,
     ) -> Task<Result<()>> {
         let buffer = self.buffer().clone();
@@ -10332,7 +10428,9 @@ impl Editor {
         }
 
         let mut timeout = cx.background_executor().timer(FORMAT_TIMEOUT).fuse();
-        let format = project.update(cx, |project, cx| project.format(buffers, true, trigger, cx));
+        let format = project.update(cx, |project, cx| {
+            project.format(buffers, true, trigger, target, cx)
+        });
 
         cx.spawn(|_, mut cx| async move {
             let transaction = futures::select_biased! {
@@ -10773,7 +10871,7 @@ impl Editor {
             .selections
             .all::<Point>(cx)
             .iter()
-            .any(|selection| selection.range().overlaps(&intersection_range));
+            .any(|selection| RangeExt::overlaps(&selection.range(), &intersection_range));
 
         self.unfold_ranges(std::iter::once(intersection_range), true, autoscroll, cx)
     }
@@ -11243,30 +11341,32 @@ impl Editor {
         None
     }
 
+    fn target_file<'a>(&self, cx: &'a AppContext) -> Option<&'a dyn language::LocalFile> {
+        self.active_excerpt(cx)?
+            .1
+            .read(cx)
+            .file()
+            .and_then(|f| f.as_local())
+    }
+
     pub fn reveal_in_finder(&mut self, _: &RevealInFileManager, cx: &mut ViewContext<Self>) {
-        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
-            if let Some(file) = buffer.read(cx).file().and_then(|f| f.as_local()) {
-                cx.reveal_path(&file.abs_path(cx));
-            }
+        if let Some(target) = self.target_file(cx) {
+            cx.reveal_path(&target.abs_path(cx));
         }
     }
 
     pub fn copy_path(&mut self, _: &CopyPath, cx: &mut ViewContext<Self>) {
-        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
-            if let Some(file) = buffer.read(cx).file().and_then(|f| f.as_local()) {
-                if let Some(path) = file.abs_path(cx).to_str() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
-                }
+        if let Some(file) = self.target_file(cx) {
+            if let Some(path) = file.abs_path(cx).to_str() {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
             }
         }
     }
 
     pub fn copy_relative_path(&mut self, _: &CopyRelativePath, cx: &mut ViewContext<Self>) {
-        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
-            if let Some(file) = buffer.read(cx).file().and_then(|f| f.as_local()) {
-                if let Some(path) = file.path().to_str() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
-                }
+        if let Some(file) = self.target_file(cx) {
+            if let Some(path) = file.path().to_str() {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
             }
         }
     }
@@ -11477,12 +11577,10 @@ impl Editor {
     }
 
     pub fn copy_file_location(&mut self, _: &CopyFileLocation, cx: &mut ViewContext<Self>) {
-        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
-            if let Some(file) = buffer.read(cx).file().and_then(|f| f.as_local()) {
-                if let Some(path) = file.path().to_str() {
-                    let selection = self.selections.newest::<Point>(cx).start.row + 1;
-                    cx.write_to_clipboard(ClipboardItem::new_string(format!("{path}:{selection}")));
-                }
+        if let Some(file) = self.target_file(cx) {
+            if let Some(path) = file.path().to_str() {
+                let selection = self.selections.newest::<Point>(cx).start.row + 1;
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("{path}:{selection}")));
             }
         }
     }
@@ -12119,9 +12217,14 @@ impl Editor {
                 }
 
                 let Some(project) = &self.project else { return };
-                let telemetry = project.read(cx).client().telemetry().clone();
+                let (telemetry, is_via_ssh) = {
+                    let project = project.read(cx);
+                    let telemetry = project.client().telemetry().clone();
+                    let is_via_ssh = project.is_via_ssh();
+                    (telemetry, is_via_ssh)
+                };
                 refresh_linked_ranges(self, cx);
-                telemetry.log_edit_event("editor");
+                telemetry.log_edit_event("editor", is_via_ssh);
             }
             multi_buffer::Event::ExcerptsAdded {
                 buffer,
@@ -12243,12 +12346,9 @@ impl Editor {
         let buffer = self.buffer.read(cx);
         let mut new_selections_by_buffer = HashMap::default();
         for selection in self.selections.all::<usize>(cx) {
-            for (buffer, mut range, _) in
+            for (buffer, range, _) in
                 buffer.range_to_buffer_ranges(selection.start..selection.end, cx)
             {
-                if selection.reversed {
-                    mem::swap(&mut range.start, &mut range.end);
-                }
                 let mut range = range.to_point(buffer.read(cx));
                 range.start.column = 0;
                 range.end.column = buffer.read(cx).line_len(range.end.row);
@@ -12298,14 +12398,22 @@ impl Editor {
 
         let mut new_selections_by_buffer = HashMap::default();
         for selection in self.selections.all::<usize>(cx) {
-            for (buffer, mut range, _) in
-                buffer.range_to_buffer_ranges(selection.start..selection.end, cx)
+            for (mut buffer_handle, mut range, _) in
+                buffer.range_to_buffer_ranges(selection.range(), cx)
             {
+                // When editing branch buffers, jump to the corresponding location
+                // in their base buffer.
+                let buffer = buffer_handle.read(cx);
+                if let Some(base_buffer) = buffer.diff_base_buffer() {
+                    range = buffer.range_to_version(range, &base_buffer.read(cx).version());
+                    buffer_handle = base_buffer;
+                }
+
                 if selection.reversed {
                     mem::swap(&mut range.start, &mut range.end);
                 }
                 new_selections_by_buffer
-                    .entry(buffer)
+                    .entry(buffer_handle)
                     .or_insert(Vec::new())
                     .push(range)
             }
@@ -12465,13 +12573,15 @@ impl Editor {
             .settings_at(0, cx)
             .show_inline_completions;
 
-        let telemetry = project.read(cx).client().telemetry().clone();
+        let project = project.read(cx);
+        let telemetry = project.client().telemetry().clone();
         telemetry.report_editor_event(
             file_extension,
             vim_mode,
             operation,
             copilot_enabled,
             copilot_enabled_for_language,
+            project.is_via_ssh(),
         )
     }
 
@@ -12588,24 +12698,13 @@ impl Editor {
     }
 
     pub fn supports_inlay_hints(&self, cx: &AppContext) -> bool {
-        let Some(project) = self.project.as_ref() else {
+        let Some(provider) = self.semantics_provider.as_ref() else {
             return false;
         };
-        let project = project.read(cx);
 
         let mut supports = false;
         self.buffer().read(cx).for_each_buffer(|buffer| {
-            if !supports {
-                supports = project
-                    .language_servers_for_buffer(buffer.read(cx), cx)
-                    .any(
-                        |(_, server)| match server.capabilities().inlay_hint_provider {
-                            Some(lsp::OneOf::Left(enabled)) => enabled,
-                            Some(lsp::OneOf::Right(_)) => true,
-                            None => false,
-                        },
-                    )
-            }
+            supports |= provider.supports_inlay_hints(buffer, cx);
         });
         supports
     }
@@ -12871,6 +12970,62 @@ impl CollaborationHub for Model<Project> {
     }
 }
 
+pub trait SemanticsProvider {
+    fn hover(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        cx: &mut AppContext,
+    ) -> Option<Task<Vec<project::Hover>>>;
+
+    fn inlay_hints(
+        &self,
+        buffer_handle: Model<Buffer>,
+        range: Range<text::Anchor>,
+        cx: &mut AppContext,
+    ) -> Option<Task<anyhow::Result<Vec<InlayHint>>>>;
+
+    fn resolve_inlay_hint(
+        &self,
+        hint: InlayHint,
+        buffer_handle: Model<Buffer>,
+        server_id: LanguageServerId,
+        cx: &mut AppContext,
+    ) -> Option<Task<anyhow::Result<InlayHint>>>;
+
+    fn supports_inlay_hints(&self, buffer: &Model<Buffer>, cx: &AppContext) -> bool;
+
+    fn document_highlights(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Vec<DocumentHighlight>>>>;
+
+    fn definitions(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        kind: GotoDefinitionKind,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Vec<LocationLink>>>>;
+
+    fn range_for_rename(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Option<Range<text::Anchor>>>>>;
+
+    fn perform_rename(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        new_name: String,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<ProjectTransaction>>>;
+}
+
 pub trait CompletionProvider {
     fn completions(
         &self,
@@ -12967,18 +13122,11 @@ fn snippet_completions(
         return vec![];
     }
     let snapshot = buffer.read(cx).text_snapshot();
-    let chunks = snapshot.reversed_chunks_in_range(text::Anchor::MIN..buffer_position);
-
-    let mut lines = chunks.lines();
-    let Some(line_at) = lines.next().filter(|line| !line.is_empty()) else {
-        return vec![];
-    };
+    let chars = snapshot.reversed_chars_for_range(text::Anchor::MIN..buffer_position);
 
     let scope = language.map(|language| language.default_scope());
     let classifier = CharClassifier::new(scope).for_completion(true);
-    let mut last_word = line_at
-        .chars()
-        .rev()
+    let mut last_word = chars
         .take_while(|c| classifier.is_word(*c))
         .collect::<String>();
     last_word = last_word.chars().rev().collect();
@@ -13119,6 +13267,102 @@ impl CompletionProvider for Model<Project> {
             .completion_triggers()
             .iter()
             .any(|string| string == text)
+    }
+}
+
+impl SemanticsProvider for Model<Project> {
+    fn hover(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        cx: &mut AppContext,
+    ) -> Option<Task<Vec<project::Hover>>> {
+        Some(self.update(cx, |project, cx| project.hover(buffer, position, cx)))
+    }
+
+    fn document_highlights(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Vec<DocumentHighlight>>>> {
+        Some(self.update(cx, |project, cx| {
+            project.document_highlights(buffer, position, cx)
+        }))
+    }
+
+    fn definitions(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        kind: GotoDefinitionKind,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Vec<LocationLink>>>> {
+        Some(self.update(cx, |project, cx| match kind {
+            GotoDefinitionKind::Symbol => project.definition(&buffer, position, cx),
+            GotoDefinitionKind::Declaration => project.declaration(&buffer, position, cx),
+            GotoDefinitionKind::Type => project.type_definition(&buffer, position, cx),
+            GotoDefinitionKind::Implementation => project.implementation(&buffer, position, cx),
+        }))
+    }
+
+    fn supports_inlay_hints(&self, buffer: &Model<Buffer>, cx: &AppContext) -> bool {
+        // TODO: make this work for remote projects
+        self.read(cx)
+            .language_servers_for_buffer(buffer.read(cx), cx)
+            .any(
+                |(_, server)| match server.capabilities().inlay_hint_provider {
+                    Some(lsp::OneOf::Left(enabled)) => enabled,
+                    Some(lsp::OneOf::Right(_)) => true,
+                    None => false,
+                },
+            )
+    }
+
+    fn inlay_hints(
+        &self,
+        buffer_handle: Model<Buffer>,
+        range: Range<text::Anchor>,
+        cx: &mut AppContext,
+    ) -> Option<Task<anyhow::Result<Vec<InlayHint>>>> {
+        Some(self.update(cx, |project, cx| {
+            project.inlay_hints(buffer_handle, range, cx)
+        }))
+    }
+
+    fn resolve_inlay_hint(
+        &self,
+        hint: InlayHint,
+        buffer_handle: Model<Buffer>,
+        server_id: LanguageServerId,
+        cx: &mut AppContext,
+    ) -> Option<Task<anyhow::Result<InlayHint>>> {
+        Some(self.update(cx, |project, cx| {
+            project.resolve_inlay_hint(hint, buffer_handle, server_id, cx)
+        }))
+    }
+
+    fn range_for_rename(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Option<Range<text::Anchor>>>>> {
+        Some(self.update(cx, |project, cx| {
+            project.prepare_rename(buffer.clone(), position, cx)
+        }))
+    }
+
+    fn perform_rename(
+        &self,
+        buffer: &Model<Buffer>,
+        position: text::Anchor,
+        new_name: String,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<ProjectTransaction>>> {
+        Some(self.update(cx, |project, cx| {
+            project.perform_rename(buffer.clone(), position, new_name, cx)
+        }))
     }
 }
 
@@ -13415,6 +13659,7 @@ pub enum EditorEvent {
     TransactionBegun {
         transaction_id: clock::Lamport,
     },
+    Reloaded,
     CursorShapeChanged,
 }
 
