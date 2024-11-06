@@ -4108,7 +4108,6 @@ dependencies = [
  "project",
  "regex",
  "release_channel",
- "reqwest_client",
  "schemars",
  "semantic_version",
  "serde",
